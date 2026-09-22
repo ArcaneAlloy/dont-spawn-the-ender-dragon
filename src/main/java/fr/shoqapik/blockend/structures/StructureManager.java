@@ -19,6 +19,8 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructurePlaceSettings;
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
 
@@ -192,20 +194,77 @@ public class StructureManager implements Savable {
         }
 
 
+        // Antes: recogia aqui mismo, de forma sincrona, TODAS las posiciones
+        // a limpiar (hasta ~4,37M comprobaciones getBlockState, radio 200,
+        // y< 70) antes de encolar nada. Eso es lo que bloqueaba el hilo del
+        // servidor varios segundos de un tiron.
+        //
+        // Ahora: cleanAreaBatched() se limita a encolar una tarea de
+        // escaneo POR CHUNK (16x16 columnas) -- 256 tareas para la rejilla
+        // -125..125 -- que se reparten via la misma cola `tasks`/tick() que
+        // ya existe. Cada tarea de escaneo, cuando le toca, salta secciones
+        // de 16 niveles enteras que ya son aire (LevelChunkSection#hasOnlyAir)
+        // sin llamar a getBlockState() ni una vez para esas posiciones, y
+        // solo entonces encola sus propios lotes de limpieza de CLEAN_BATCH
+        // en bloques, exactamente igual que antes.
+        //
+        // El resultado final en el mundo es identico: se limpia lo mismo
+        // (todo lo que no sea obsidiana dentro del radio), solo cambia
+        // como se reparte el trabajo en el tiempo.
         private void cleanAreaBatched(ServerLevel level) {
+            int minY = level.getMinBuildHeight();
+
+            int minChunk = -125 >> 4;
+            int maxChunk = (125 - 1) >> 4;
+
+            for (int cxOuter = minChunk; cxOuter <= maxChunk; cxOuter++) {
+                for (int czOuter = minChunk; czOuter <= maxChunk; czOuter++) {
+                    final int cx = cxOuter;
+                    final int cz = czOuter;
+                    tasks.add(() -> scanAndQueueChunkCleanup(level, cx, cz, minY));
+                }
+            }
+        }
+
+        private void scanAndQueueChunkCleanup(ServerLevel level, int cx, int cz, int minY) {
+            int baseX = cx << 4;
+            int baseZ = cz << 4;
+
+            if (!chunkTouchesCleanupRadius(baseX, baseZ)) {
+                return;
+            }
+
+            LevelChunk chunk = level.getChunk(cx, cz);
+            LevelChunkSection[] sections = chunk.getSections();
 
             List<BlockPos> positions = new ArrayList<>();
 
-            for (int x = -125; x < 125; x++) {
-                for (int z = -125; z < 125; z++) {
-                    if (Math.sqrt(x * x + z * z) < 200) {
-                        for (int y = level.getMinBuildHeight(); y < 70; y++) {
-                            BlockPos pos = new BlockPos(x, y, z);
+            for (int y = minY; y < 70; y++) {
+                if (((y - minY) & 15) == 0) {
+                    int sectionIndex = (y - minY) >> 4;
+                    LevelChunkSection section = (sectionIndex >= 0 && sectionIndex < sections.length)
+                            ? sections[sectionIndex]
+                            : null;
 
-                            if (!level.getBlockState(pos).is(Blocks.OBSIDIAN)) {
-                                positions.add(pos);
-                            }
-                        }
+                    if (section != null && section.hasOnlyAir()) {
+                        // Seccion entera (16 niveles) ya vacia: nos la
+                        // saltamos sin leer ni un solo bloque.
+                        y = Math.min(y + 16, 70) - 1;
+                        continue;
+                    }
+                }
+
+                for (int x = baseX; x < baseX + 16; x++) {
+                    if (x < -125 || x >= 125) continue;
+
+                    for (int z = baseZ; z < baseZ + 16; z++) {
+                        if (z < -125 || z >= 125) continue;
+                        if (!(Math.sqrt((double) x * x + (double) z * z) < 200.0)) continue;
+
+                        BlockPos pos = new BlockPos(x, y, z);
+                        if (level.getBlockState(pos).is(Blocks.OBSIDIAN)) continue;
+
+                        positions.add(pos);
                     }
                 }
             }
@@ -220,6 +279,23 @@ public class StructureManager implements Savable {
                     }
                 });
             }
+        }
+
+        private static boolean chunkTouchesCleanupRadius(int baseX, int baseZ) {
+            for (int dx = 0; dx < 16; dx++) {
+                int x = baseX + dx;
+                if (x < -125 || x >= 125) continue;
+
+                for (int dz = 0; dz < 16; dz++) {
+                    int z = baseZ + dz;
+                    if (z < -125 || z >= 125) continue;
+
+                    if (Math.sqrt((double) x * x + (double) z * z) < 200.0) {
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
 
         public void makeInitialIsland(ServerLevel level) {
