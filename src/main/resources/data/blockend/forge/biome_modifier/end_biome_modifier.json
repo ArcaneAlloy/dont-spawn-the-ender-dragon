@@ -1,0 +1,7 @@
+{
+  "type": "forge:remove_features",
+  "biomes": "minecraft:the_end",
+  "features": [
+    "minecraft:end_gateway_return","minecraft:end_spike"
+  ]
+}
